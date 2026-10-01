@@ -8,7 +8,7 @@ void push();
 void pop();
 void display();
 
-int read_integer(int *value)
+static int read_integer(int *value)
 {
     int result = scanf("%d", value);
     int character;
@@ -49,7 +49,7 @@ int main()
             case 2: pop(); break;
             case 3: display(); break;
             case 4: break;
-            default: printf("Invalid choice");
+            default: printf("Invalid choice\n");
         }
     }while(choice!=4);
 
