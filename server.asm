@@ -1,125 +1,135 @@
-section .data
-    listen_sock     equ 3               ; File descriptor for listening socket
-    conn_sock       equ 4               ; File descriptor for connection socket
-    backlog         equ 5               ; Maximum length to which the queue of pending connections may grow
-    buf_size        equ 1024            ; Buffer size for receiving data
+BITS 32
 
-    crlf            db 0x0D, 0x0A      ; Carriage return, Line feed
-    response        db 'HTTP/1.1 200 OK', crlf
-                    db 'Content-Type: text/plain', crlf
-                    db '', crlf
-                    db 'Hello, World!', crlf
-                    db 0               ; Null terminator
+; Assemble as ELF32 and link for Linux i386. The server listens on port 8080.
+
+%define SYS_EXIT       1
+%define SYS_READ       3
+%define SYS_WRITE      4
+%define SYS_CLOSE      6
+%define SYS_SOCKETCALL 102
+
+%define SOCKET         1
+%define BIND           2
+%define LISTEN         4
+%define ACCEPT         5
+
+%define AF_INET        2
+%define SOCK_STREAM    1
+%define BACKLOG        5
+%define BUF_SIZE       1024
+
+section .data
+sockaddr:
+    dw AF_INET
+    dw 0x901F                 ; Port 8080 in network byte order
+    dd 0                      ; Bind to any local IPv4 address
+    times 8 db 0
+sockaddr_len equ $ - sockaddr
+
+socket_args  dd AF_INET, SOCK_STREAM, 0
+bind_args    dd 0, sockaddr, sockaddr_len
+listen_args  dd 0, BACKLOG
+accept_args  dd 0, 0, 0
+listen_sock  dd -1
+
+response:
+    db 'HTTP/1.1 200 OK', 13, 10
+    db 'Content-Type: text/plain; charset=utf-8', 13, 10
+    db 'Content-Length: 15', 13, 10
+    db 'Connection: close', 13, 10, 13, 10
+    db 'Hello, World!', 13, 10
+response_len equ $ - response
+
+error_message db 'server.asm: system call failed', 10
+error_message_len equ $ - error_message
 
 section .bss
-    addr            resb 16            ; Buffer for storing remote address
-    buf             resb buf_size      ; Buffer for receiving data
+conn_sock   resd 1
+buf         resb BUF_SIZE
 
 section .text
-    global _start
+global _start
 
 _start:
-    ; Create a socket
-    mov eax, 102        ; sys_socketcall syscall number
-    mov ebx, 1          ; socketcall: SYS_SOCKET
-    mov ecx, 1          ; AF_INET: IPv4 protocol family
-    mov edx, 1          ; SOCK_STREAM: TCP socket type
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    ; Create an IPv4 TCP socket.
+    mov eax, SYS_SOCKETCALL
+    mov ebx, SOCKET
+    mov ecx, socket_args
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    js fatal
+    mov [listen_sock], eax
+    mov [bind_args], eax
+    mov [listen_args], eax
+    mov [accept_args], eax
 
-    mov dword [listen_sock], eax   ; Store the listening socket file descriptor
-
-    ; Bind the socket to an address and port
-    ; (Assuming binding to port 8080 and any available address)
-    mov eax, 102        ; sys_socketcall syscall number
-    mov ebx, 2          ; socketcall: SYS_BIND
-    mov ecx, dword [listen_sock]  ; Socket file descriptor
-    lea edx, [addr]     ; Pointer to the sockaddr_in structure
-    mov esi, 16         ; Size of the sockaddr_in structure
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    ; Bind to port 8080 and start listening.
+    mov eax, SYS_SOCKETCALL
+    mov ebx, BIND
+    mov ecx, bind_args
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    js fatal
 
-    ; Listen for incoming connections
-    mov eax, 106        ; sys_socketcall syscall number
-    mov ebx, 4          ; socketcall: SYS_LISTEN
-    mov ecx, dword [listen_sock]  ; Socket file descriptor
-    mov edx, backlog    ; Maximum length to which the queue of pending connections may grow
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    mov eax, SYS_SOCKETCALL
+    mov ebx, LISTEN
+    mov ecx, listen_args
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    js fatal
 
 accept_loop:
-    ; Accept incoming connections
-    mov eax, 102        ; sys_socketcall syscall number
-    mov ebx, 5          ; socketcall: SYS_ACCEPT
-    mov ecx, dword [listen_sock]  ; Socket file descriptor
-    lea edx, [addr]     ; Pointer to the sockaddr_in structure to store the remote address
-    lea esi, [conn_sock] ; Pointer to store the new connection socket file descriptor
-    mov edi, 16         ; Size of the sockaddr_in structure
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    mov eax, SYS_SOCKETCALL
+    mov ebx, ACCEPT
+    mov ecx, accept_args
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    js fatal
+    mov [conn_sock], eax
 
-    ; Read data from the client
-    mov eax, 3          ; sys_read syscall number
-    mov ebx, dword [conn_sock]  ; Connection socket file descriptor
-    lea ecx, [buf]      ; Buffer to store received data
-    mov edx, buf_size   ; Maximum number of bytes to read
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    ; Read a request before sending the fixed response.
+    mov eax, SYS_READ
+    mov ebx, [conn_sock]
+    mov ecx, buf
+    mov edx, BUF_SIZE
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    jle close_client
 
-    ; Send the response back to the client
-    mov eax, 4          ; sys_write syscall number
-    mov ebx, dword [conn_sock]  ; Connection socket file descriptor
-    lea ecx, [response] ; Response buffer
-    mov edx, response_len  ; Length of the response
-    int 0x80            ; call kernel
-
-    ; Check for errors
+    mov esi, response
+    mov edi, response_len
+write_response:
+    mov eax, SYS_WRITE
+    mov ebx, [conn_sock]
+    mov ecx, esi
+    mov edx, edi
+    int 0x80
     test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
+    jle close_client
+    add esi, eax
+    sub edi, eax
+    jnz write_response
 
-    ; Close the connection socket
-    mov eax, 6          ; sys_close syscall number
-    mov ebx, dword [conn_sock]  ; Connection socket file descriptor
-    int 0x80            ; call kernel
-
-    ; Check for errors
-    test eax, eax
-    js error_handling   ; Jump to error_handling if syscall returned with an error
-
-    ; Go back to accept more connections
+close_client:
+    mov eax, SYS_CLOSE
+    mov ebx, [conn_sock]
+    int 0x80
     jmp accept_loop
 
-error_handling:
-    ; Handle error
-    ; Print an error message or perform error recovery
-    jmp exit
+fatal:
+    mov eax, SYS_WRITE
+    mov ebx, 2
+    mov ecx, error_message
+    mov edx, error_message_len
+    int 0x80
 
-exit:
-    ; Close the listening socket
-    mov eax, 6          ; sys_close syscall number
-    mov ebx, dword [listen_sock]  ; Listening socket file descriptor
-    int 0x80            ; call kernel
+    cmp dword [listen_sock], -1
+    je exit_program
+    mov eax, SYS_CLOSE
+    mov ebx, [listen_sock]
+    int 0x80
 
-    ; Exit the program
-    mov eax, 1          ; sys_exit syscall number
-    xor ebx, ebx        ; Exit code 0
-    int 0x80            ; call kernel
-
-section .data
-    prompt_msg      db 'Enter your message: ', 0
-    prompt_len      equ $ - prompt_msg
+exit_program:
+    mov eax, SYS_EXIT
+    mov ebx, 1
+    int 0x80
